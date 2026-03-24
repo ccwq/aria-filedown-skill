@@ -1,11 +1,16 @@
 import argparse
+import json
 import os
 import platform
+import secrets
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tarfile
+import threading
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -22,6 +27,7 @@ DEFAULT_PROXY_HINTS = [
     "http://host.docker.internal:7897",
     "socks5://host.docker.internal:7897",
 ]
+PROGRESS_MODES = {"auto", "tty", "jsonl", "off"}
 
 
 def get_system_type():
@@ -54,6 +60,10 @@ def resolve_install_dir(explicit_dir=None):
     env_dir = os.environ.get("ARIA2C")
     if env_dir:
         return Path(env_dir).expanduser().resolve()
+
+    env_bin = os.environ.get("ARIA2C_BIN")
+    if env_bin:
+        return Path(env_bin).expanduser().resolve().parent
     return None
 
 
@@ -82,7 +92,7 @@ def find_via_env_bin():
         return None, "ARIA2C_BIN 未设置"
     if is_executable_file(candidate):
         return candidate, f"使用 ARIA2C_BIN 指定的 aria2c: {candidate}"
-    return None, f"ARIA2C_BIN 指向的文件不可执行或不存在: {candidate}"
+    return None, f"ARIA2C_BIN 指向的文件不可执行或不存在，将在后续安装阶段尝试自动补齐: {candidate}"
 
 
 def find_via_path():
@@ -283,7 +293,384 @@ def append_default_download_args(cmd):
         cmd.append("-c")
 
 
-def run_download(download_args, install=False, install_dir=None, proxy=None):
+def iter_option_values(args):
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item.startswith("--") and "=" in item:
+            name, value = item.split("=", 1)
+            yield name, value
+        elif item.startswith("--") and index + 1 < len(args):
+            yield item, args[index + 1]
+            index += 1
+        index += 1
+
+
+def find_option_value(args, option_name):
+    for name, value in iter_option_values(args):
+        if name == option_name:
+            return value
+    return None
+
+
+def has_flag(args, option_name):
+    return option_name in args or any(item.startswith(f"{option_name}=") for item in args)
+
+
+def reserve_local_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def create_rpc_config(download_args):
+    warnings = []
+    user_enable_rpc = find_option_value(download_args, "--enable-rpc")
+    if user_enable_rpc == "false":
+        warnings.append("检测到用户传入 --enable-rpc=false，无法启用统一进度输出。")
+        return None, warnings
+
+    port = find_option_value(download_args, "--rpc-listen-port")
+    if port is None:
+        port = str(reserve_local_port())
+    else:
+        warnings.append(f"沿用用户指定的 RPC 端口: {port}")
+
+    secret = find_option_value(download_args, "--rpc-secret")
+    if secret is None:
+        secret = secrets.token_hex(16)
+    else:
+        warnings.append("沿用用户指定的 RPC secret。")
+
+    if has_flag(download_args, "--show-console-readout"):
+        warnings.append("检测到用户显式配置 --show-console-readout，可能与 wrapper 进度输出叠加。")
+    if has_flag(download_args, "--summary-interval"):
+        warnings.append("检测到用户显式配置 --summary-interval，可能影响 wrapper 进度节奏。")
+
+    rpc_args = []
+    if not has_flag(download_args, "--enable-rpc"):
+        rpc_args.append("--enable-rpc=true")
+    if not has_flag(download_args, "--rpc-listen-port"):
+        rpc_args.append(f"--rpc-listen-port={port}")
+    if not has_flag(download_args, "--rpc-secret"):
+        rpc_args.append(f"--rpc-secret={secret}")
+    if not has_flag(download_args, "--rpc-listen-all"):
+        rpc_args.append("--rpc-listen-all=false")
+    if not has_flag(download_args, "--show-console-readout"):
+        rpc_args.append("--show-console-readout=false")
+    if not has_flag(download_args, "--summary-interval"):
+        rpc_args.append("--summary-interval=0")
+    if not has_flag(download_args, "--console-log-level"):
+        rpc_args.append("--console-log-level=warn")
+
+    return {
+        "port": int(port),
+        "secret": secret,
+        "args": rpc_args,
+    }, warnings
+
+
+def rpc_request(port, secret, method, params=None, timeout=3):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": method,
+        "method": method,
+        "params": [f"token:{secret}", *(params or [])],
+    }
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/jsonrpc",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    if "error" in data:
+        raise RuntimeError(f"RPC 错误: {data['error']}")
+    return data["result"]
+
+
+def wait_for_rpc_ready(process, rpc_config, timeout=8):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if process.poll() is not None:
+            return False
+        try:
+            rpc_request(
+                rpc_config["port"],
+                rpc_config["secret"],
+                "aria2.getVersion",
+            )
+            return True
+        except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, json.JSONDecodeError):
+            time.sleep(0.2)
+    return False
+
+
+def safe_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def extract_primary_file(item):
+    files = item.get("files") or []
+    if files:
+        file_path = files[0].get("path")
+        if file_path:
+            return file_path
+        uris = files[0].get("uris") or []
+        if uris:
+            return uris[0].get("uri")
+    return None
+
+
+def build_progress_snapshot(items):
+    if not items:
+        return None
+
+    completed_bytes = sum(safe_int(item.get("completedLength")) for item in items)
+    total_bytes = sum(safe_int(item.get("totalLength")) for item in items)
+    download_speed = sum(safe_int(item.get("downloadSpeed")) for item in items)
+    connections = sum(safe_int(item.get("connections")) for item in items)
+    percent = 0.0
+    if total_bytes > 0:
+        percent = round((completed_bytes / total_bytes) * 100, 2)
+
+    remaining = max(total_bytes - completed_bytes, 0)
+    eta_seconds = None
+    if download_speed > 0:
+        eta_seconds = int(remaining / download_speed)
+
+    primary = items[0]
+    file_name = extract_primary_file(primary)
+    gid = primary.get("gid")
+    status = primary.get("status", "active")
+    if len(items) > 1:
+        file_name = f"{file_name or 'multi-download'} (+{len(items) - 1})"
+
+    return {
+        "gid": gid,
+        "file": file_name,
+        "status": status,
+        "percent": percent,
+        "completed_bytes": completed_bytes,
+        "total_bytes": total_bytes,
+        "download_speed": download_speed,
+        "eta_seconds": eta_seconds,
+        "connections": connections,
+        "timestamp": int(time.time()),
+    }
+
+
+def collect_progress_state(rpc_config):
+    active_items = rpc_request(
+        rpc_config["port"],
+        rpc_config["secret"],
+        "aria2.tellActive",
+    )
+    snapshot = build_progress_snapshot(active_items)
+    if snapshot:
+        return snapshot, "active"
+
+    waiting_items = rpc_request(
+        rpc_config["port"],
+        rpc_config["secret"],
+        "aria2.tellWaiting",
+        [0, 10],
+    )
+    snapshot = build_progress_snapshot(waiting_items)
+    if snapshot:
+        return snapshot, "waiting"
+
+    stopped_items = rpc_request(
+        rpc_config["port"],
+        rpc_config["secret"],
+        "aria2.tellStopped",
+        [0, 10],
+    )
+    snapshot = build_progress_snapshot(stopped_items)
+    if snapshot:
+        return snapshot, "stopped"
+    return None, None
+
+
+def format_bytes(value):
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    number = float(value)
+    unit_index = 0
+    while number >= 1024 and unit_index < len(units) - 1:
+        number /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(number)} {units[unit_index]}"
+    return f"{number:.1f} {units[unit_index]}"
+
+
+def format_eta(seconds):
+    if seconds is None:
+        return "--:--"
+    minutes, sec = divmod(max(seconds, 0), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{sec:02d}"
+    return f"{minutes:02d}:{sec:02d}"
+
+
+class ProgressReporter:
+    def __init__(self, mode, interval, progress_file=None):
+        self.mode = mode
+        self.interval = interval
+        self.progress_file = Path(progress_file).expanduser().resolve() if progress_file else None
+        self._last_line_length = 0
+        self._file_handle = None
+        self._is_tty = sys.stdout.isatty()
+        if self.mode == "auto":
+            self.render_mode = "tty" if self._is_tty else "text"
+        elif self.mode == "tty":
+            self.render_mode = "tty" if self._is_tty else "text"
+        elif self.mode == "jsonl":
+            self.render_mode = "jsonl"
+        else:
+            self.render_mode = "off"
+
+    def open(self):
+        if self.progress_file:
+            self.progress_file.parent.mkdir(parents=True, exist_ok=True)
+            self._file_handle = self.progress_file.open("a", encoding="utf-8")
+
+    def close(self):
+        if self.render_mode == "tty" and self._last_line_length:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._last_line_length = 0
+        if self._file_handle:
+            self._file_handle.close()
+            self._file_handle = None
+
+    def emit_progress(self, snapshot):
+        if self.render_mode == "off" or not snapshot:
+            return
+        if self.render_mode == "jsonl":
+            self._write_json({"type": "progress", **snapshot})
+            return
+
+        line = (
+            f"{snapshot['percent']:6.2f}% | "
+            f"{format_bytes(snapshot['completed_bytes'])}/"
+            f"{format_bytes(snapshot['total_bytes']) if snapshot['total_bytes'] else '?'} | "
+            f"{format_bytes(snapshot['download_speed'])}/s | "
+            f"ETA {format_eta(snapshot['eta_seconds'])} | "
+            f"{snapshot['file'] or 'unknown'}"
+        )
+        if self.render_mode == "tty":
+            padded = line.ljust(self._last_line_length)
+            sys.stdout.write(f"\r{padded}")
+            sys.stdout.flush()
+            self._last_line_length = len(padded)
+        else:
+            print(line)
+
+    def emit_terminal(self, event_type, snapshot, returncode):
+        snapshot = snapshot or {}
+        if self.render_mode == "jsonl":
+            payload = {
+                "type": event_type,
+                "returncode": returncode,
+                **snapshot,
+                "timestamp": int(time.time()),
+            }
+            self._write_json(payload)
+            return
+
+        if self.render_mode == "tty" and self._last_line_length:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._last_line_length = 0
+
+        if event_type == "completed":
+            print(
+                "下载完成: "
+                f"{snapshot.get('file') or 'unknown'} | "
+                f"{format_bytes(snapshot.get('total_bytes', 0))} | "
+                f"exit={returncode}"
+            )
+        elif event_type == "error":
+            print(
+                "下载失败: "
+                f"{snapshot.get('file') or 'unknown'} | "
+                f"status={snapshot.get('status', 'unknown')} | "
+                f"exit={returncode}"
+            )
+
+    def _write_json(self, payload):
+        line = json.dumps(payload, ensure_ascii=False)
+        print(line)
+        if self._file_handle:
+            self._file_handle.write(f"{line}\n")
+            self._file_handle.flush()
+
+
+def stream_process_output(pipe, buffer):
+    if pipe is None:
+        return
+    try:
+        for line in pipe:
+            text = line.rstrip()
+            if text:
+                buffer.append(text)
+                print(f"[aria2] {text}", file=sys.stderr)
+    finally:
+        pipe.close()
+
+
+def launch_download_process(cmd):
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    stderr_lines = []
+    stderr_thread = threading.Thread(
+        target=stream_process_output,
+        args=(process.stderr, stderr_lines),
+        daemon=True,
+    )
+    stderr_thread.start()
+    return process, stderr_lines, stderr_thread
+
+
+def monitor_download_process(process, rpc_config, reporter):
+    last_snapshot = None
+    while process.poll() is None:
+        try:
+            snapshot, source = collect_progress_state(rpc_config)
+            if snapshot:
+                last_snapshot = snapshot
+                if source != "stopped":
+                    reporter.emit_progress(snapshot)
+                else:
+                    # aria2 开启 RPC 后在下载完成时可能继续驻留，这里主动 shutdown 收尾。
+                    try:
+                        rpc_request(
+                            rpc_config["port"],
+                            rpc_config["secret"],
+                            "aria2.shutdown",
+                        )
+                    except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, json.JSONDecodeError):
+                        pass
+                    break
+        except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, json.JSONDecodeError) as error:
+            print(f"进度轮询失败: {error}", file=sys.stderr)
+        time.sleep(reporter.interval)
+    return last_snapshot
+
+
+def run_download(download_args, install=False, install_dir=None, proxy=None, progress="auto", progress_interval=1.0, progress_file=None):
     binary_path = ensure_aria2_available(
         install=install,
         install_dir=install_dir,
@@ -293,6 +680,10 @@ def run_download(download_args, install=False, install_dir=None, proxy=None):
         print("aria2 不可用，无法执行下载。")
         return 2
 
+    if progress_file and progress != "jsonl":
+        print("--progress-file 仅能与 --progress jsonl 一起使用。")
+        return 2
+
     cmd = [str(binary_path)]
     cmd.extend(download_args)
 
@@ -300,11 +691,64 @@ def run_download(download_args, install=False, install_dir=None, proxy=None):
         cmd.append(f"--all-proxy={proxy}")
 
     append_default_download_args(cmd)
-    print(f"执行命令: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        print(f"aria2 执行失败(exit={result.returncode})")
-    return result.returncode
+
+    reporter = ProgressReporter(
+        mode=progress,
+        interval=progress_interval,
+        progress_file=progress_file,
+    )
+    reporter.open()
+
+    try:
+        if progress == "off":
+            print(f"执行命令: {' '.join(cmd)}")
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                print(f"aria2 执行失败(exit={result.returncode})")
+            return result.returncode
+
+        rpc_config, warnings = create_rpc_config(cmd)
+        for warning in warnings:
+            print(f"提示: {warning}")
+        if not rpc_config:
+            print("无法为当前下载启用统一进度输出，请调整参数后重试。")
+            return 2
+
+        cmd.extend(rpc_config["args"])
+        print(f"执行命令: {' '.join(cmd)}")
+
+        process, stderr_lines, stderr_thread = launch_download_process(cmd)
+        try:
+            if not wait_for_rpc_ready(process, rpc_config):
+                process.wait(timeout=2)
+                print("aria2 RPC 未能成功启动，无法输出统一进度。", file=sys.stderr)
+                if stderr_lines:
+                    print("最近的 aria2 输出:", file=sys.stderr)
+                    for line in stderr_lines[-10:]:
+                        print(f"  {line}", file=sys.stderr)
+                return process.returncode if process.returncode is not None else 2
+
+            last_snapshot = monitor_download_process(process, rpc_config, reporter)
+            returncode = process.wait()
+            stderr_thread.join(timeout=1)
+
+            try:
+                final_snapshot, _ = collect_progress_state(rpc_config)
+                final_snapshot = final_snapshot or last_snapshot
+            except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, json.JSONDecodeError):
+                final_snapshot = last_snapshot
+
+            if returncode == 0:
+                reporter.emit_terminal("completed", final_snapshot, returncode)
+            else:
+                reporter.emit_terminal("error", final_snapshot, returncode)
+                print(f"aria2 执行失败(exit={returncode})")
+            return returncode
+        finally:
+            if process.poll() is None:
+                process.terminate()
+    finally:
+        reporter.close()
 
 
 def build_parser():
@@ -330,6 +774,22 @@ def build_parser():
         help="下载 aria2 或执行下载时使用的代理，例如 http://localhost:7897。",
     )
     parser.add_argument(
+        "--progress",
+        choices=sorted(PROGRESS_MODES),
+        default="auto",
+        help="进度输出模式: auto/tty/jsonl/off。默认 auto。",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=1.0,
+        help="进度轮询间隔(秒)，默认 1.0。",
+    )
+    parser.add_argument(
+        "--progress-file",
+        help="在 jsonl 模式下将进度事件追加写入文件。",
+    )
+    parser.add_argument(
         "download_args",
         nargs=argparse.REMAINDER,
         help="透传给 aria2c 的参数，例如 URL、-d、-o 等。",
@@ -340,6 +800,10 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.progress_interval <= 0:
+        print("--progress-interval 必须大于 0。")
+        return 1
 
     download_args = list(args.download_args)
     if download_args and download_args[0] == "--":
@@ -370,6 +834,9 @@ def main():
         install=args.install,
         install_dir=args.install_dir,
         proxy=args.proxy,
+        progress=args.progress,
+        progress_interval=args.progress_interval,
+        progress_file=args.progress_file,
     )
 
 

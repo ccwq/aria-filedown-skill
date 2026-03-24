@@ -24,13 +24,13 @@
 安装这个仓库中的 `aria-filedown-skill`：
 
 ```bash
-npx skills add https://github.com/ccwq/aria-filedown-skill --skill aria-filedown
+npx skills add https://github.com/ccwq/aria-filedown-skill/tree/master/aria-filedown
 ```
 
 如果你是从本地目录安装，也可以直接用路径 + skill 名称：
 
 ```bash
-npx skills add ./aria-filedown-skill --skill aria-filedown
+npx skills add ./aria-filedown-skill/aria-filedown
 ```
 
 常用参数：
