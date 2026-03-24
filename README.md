@@ -21,16 +21,16 @@
 
 ### 1. 通过 `npx skills add` 安装
 
-本地仓库安装：
+安装这个仓库：
+
+```bash
+npx skills add https://github.com/ccwq/aria-filedown-skill
+```
+
+如果你是从本地目录安装，也可以直接用路径：
 
 ```bash
 npx skills add ./aria-filedown
-```
-
-GitHub 仓库安装：
-
-```bash
-npx skills add https://github.com/<owner>/<repo>
 ```
 
 常用参数：
@@ -39,7 +39,7 @@ npx skills add https://github.com/<owner>/<repo>
 - `-a, --agent <agents...>`：指定 agent
 - `-s, --skill <skills...>`：只安装指定 skill
 
-### 3. skills CLI 的环境变量
+### 2. skills CLI 的环境变量
 
 `npx skills add/remove` 还支持这些通用环境变量：
 
@@ -112,10 +112,10 @@ python aria-filedown/scripts/aria2-wrapper.py --install --progress jsonl --progr
 
 ## 卸载
 
-如果是通过 `npx skills add` 安装的，可以直接移除：
+如果是通过 `npx skills add` 安装的，可以直接移除这个仓库：
 
 ```bash
-npx skills remove aria-filedown
+npx skills remove aria-filedown-skill
 ```
 
 如果是全局安装的：
