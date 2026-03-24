@@ -24,13 +24,13 @@
 安装这个仓库中的 `aria-filedown-skill`：
 
 ```bash
-npx skills add https://github.com/ccwq/aria-filedown-skill --skill aria-filedown-skill
+npx skills add https://github.com/ccwq/aria-filedown-skill --skill aria-filedown
 ```
 
 如果你是从本地目录安装，也可以直接用路径 + skill 名称：
 
 ```bash
-npx skills add ./aria-filedown-skill --skill aria-filedown-skill
+npx skills add ./aria-filedown-skill --skill aria-filedown
 ```
 
 常用参数：
@@ -38,6 +38,12 @@ npx skills add ./aria-filedown-skill --skill aria-filedown-skill
 - `-g, --global`：安装到用户目录
 - `-a, --agent <agents...>`：指定 agent
 - `-s, --skill <skills...>`：只安装指定 skill
+
+说明:
+
+- 仓库名可以包含 `skill`
+- 对外暴露的 skill 名由 `SKILL.md` 的 `name` 决定
+- 这里对外的 skill 名固定是 `aria-filedown`
 
 ### 2. skills CLI 的环境变量
 
@@ -115,7 +121,7 @@ python aria-filedown/scripts/aria2-wrapper.py --install --progress jsonl --progr
 如果是通过 `npx skills add` 安装的，可以直接移除这个仓库：
 
 ```bash
-npx skills remove aria-filedown-skill
+npx skills remove aria-filedown
 ```
 
 如果是全局安装的：
